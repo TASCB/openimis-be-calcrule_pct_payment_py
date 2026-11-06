@@ -272,14 +272,9 @@ class PctPaymentCalculationRule(AbsStrategy):
     def _get_member_value(cls, individual, field_name):
         json_ext = individual.json_ext or {}
         nested_json_ext = json_ext.get("json_ext", {}) if isinstance(json_ext.get("json_ext", {}), dict) else {}
-        raw_json = nested_json_ext.get("raw", {}) if isinstance(nested_json_ext.get("raw", {}), dict) else {}
-
-        if field_name in json_ext:
-            return json_ext.get(field_name)
-        if field_name in nested_json_ext:
-            return nested_json_ext.get(field_name)
-        if field_name in raw_json:
-            return raw_json.get(field_name)
+        for source in (json_ext, json_ext.get("raw"), nested_json_ext, nested_json_ext.get("raw")):
+            if isinstance(source, dict) and field_name in source:
+                return source.get(field_name)
         return None
 
     @classmethod

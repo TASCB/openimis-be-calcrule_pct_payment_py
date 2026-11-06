@@ -51,3 +51,18 @@ class PctPaymentCalculationRuleTest(TestCase):
         self.assertTrue(breakdown["has_disability"])
         self.assertEqual(breakdown["raw_total"], 64000)
         self.assertEqual(breakdown["capped_total"], 50000)
+
+
+class MemberValueShapesTest(TestCase):
+    def _individual(self, json_ext):
+        return SimpleNamespace(dob=None, json_ext=json_ext, is_deleted=False)
+
+    def test_reads_flat_and_nested_raw(self):
+        flat = self._individual({"raw": {"primary": "2"}})
+        nested = self._individual({"json_ext": {"raw": {"primary": "3"}}})
+        both = self._individual({"raw": {"primary": "4"}, "json_ext": {"raw": {"primary": "9"}}})
+        get = PctPaymentCalculationRule._get_member_value
+        self.assertEqual(get(flat, "primary"), "2")
+        self.assertEqual(get(nested, "primary"), "3")
+        self.assertEqual(get(both, "primary"), "4")
+        self.assertIsNone(get(flat, "secondary"))
