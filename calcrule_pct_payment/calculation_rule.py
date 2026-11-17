@@ -97,14 +97,14 @@ class PctPaymentCalculationRule(AbsStrategy):
                 is_deleted=False,
             )
 
-        params = cls._get_rule_params(payment_plan)
+        params = cls.rule_params(payment_plan)
         user_id, start_date, end_date, payment_cycle = cls.get_payment_cycle_parameters(**kwargs)
         user = User.objects.filter(id=user_id).first()
         reference_date = end_date or start_date or date.today()
 
         beneficiaries = beneficiaries.select_related("group").prefetch_related("group__groupindividuals__individual")
         for beneficiary in beneficiaries:
-            breakdown = cls._calculate_household_breakdown(
+            breakdown = cls.household_breakdown(
                 beneficiary,
                 params,
                 reference_date=reference_date,
@@ -166,7 +166,7 @@ class PctPaymentCalculationRule(AbsStrategy):
         )
 
     @classmethod
-    def _get_rule_params(cls, payment_plan):
+    def rule_params(cls, payment_plan):
         params = (payment_plan.json_ext or {}).get("calculation_rule", {})
         return {
             "base_amount": cls._as_decimal(params.get("base_amount", "14000")),
@@ -180,45 +180,53 @@ class PctPaymentCalculationRule(AbsStrategy):
             "secondary_unit": cls._as_decimal(params.get("secondary_unit", "8000")),
             "secondary_cap_count": int(params.get("secondary_cap_count", 3)),
             "household_cap_amount": cls._as_decimal(params.get("household_cap_amount", "50000")),
+            "children_cap_count": int(params.get("children_cap_count", 3)),
+            "pregnant_woman_unit": cls._as_decimal(params.get("pregnant_woman_unit", "7000")),
+            "pregnant_woman_cap_count": int(params.get("pregnant_woman_cap_count", 1)),
+            "pregnancy_field": params.get("pregnancy_field", "pregnant"),
             "primary_count_field": params.get("primary_count_field", "primary"),
             "secondary_count_field": params.get("secondary_count_field", "secondary"),
         }
 
     @classmethod
-    def _calculate_household_breakdown(cls, beneficiary, params, reference_date=None):
+    def household_breakdown(cls, beneficiary, params, reference_date=None):
         members = [
             gi.individual
             for gi in beneficiary.group.groupindividuals.all()
-            if not gi.is_deleted and gi.individual and not gi.individual.is_deleted
+            if not gi.is_deleted and getattr(gi, "is_active", True)
+            and gi.individual and not gi.individual.is_deleted
         ]
 
         young_child_count_raw = sum(
             1
             for individual in members
-            if cls._is_age_in_range(
+            if cls.is_age_in_range(
                 individual.dob,
                 params["young_child_age_min"],
                 params["young_child_age_max"],
                 reference_date=reference_date,
             )
         )
-        young_child_count = min(young_child_count_raw, params["young_child_cap_count"])
-
         primary_count_raw = cls._resolve_household_count(members, params["primary_count_field"])
-        primary_count = min(primary_count_raw, params["primary_cap_count"])
-
         secondary_count_raw = cls._resolve_household_count(members, params["secondary_count_field"])
-        secondary_count = min(secondary_count_raw, params["secondary_cap_count"])
+        paid = cls.paid_child_counts(young_child_count_raw, primary_count_raw, secondary_count_raw, params)
+        young_child_count = paid["young_child"]
+        primary_count = paid["primary"]
+        secondary_count = paid["secondary"]
 
-        has_disability = any(cls._member_has_disability(individual) for individual in members)
+        has_disability = any(cls.member_has_disability(individual) for individual in members)
+        pregnant_count_raw = sum(1 for individual in members if cls.member_is_pregnant(individual, params))
+        pregnant_count = min(pregnant_count_raw, params["pregnant_woman_cap_count"])
 
         disability_amount = params["disability_top_up"] if has_disability else Decimal("0")
+        pregnant_amount = params["pregnant_woman_unit"] * Decimal(pregnant_count)
         young_child_amount = params["young_child_unit"] * Decimal(young_child_count)
         primary_amount = params["primary_unit"] * Decimal(primary_count)
         secondary_amount = params["secondary_unit"] * Decimal(secondary_count)
         raw_total = (
             params["base_amount"]
             + disability_amount
+            + pregnant_amount
             + young_child_amount
             + primary_amount
             + secondary_amount
@@ -229,6 +237,9 @@ class PctPaymentCalculationRule(AbsStrategy):
             "base_amount": cls._to_json_number(params["base_amount"]),
             "has_disability": has_disability,
             "disability_amount": cls._to_json_number(disability_amount),
+            "pregnant_count_raw": pregnant_count_raw,
+            "pregnant_count": pregnant_count,
+            "pregnant_amount": cls._to_json_number(pregnant_amount),
             "young_child_count_raw": young_child_count_raw,
             "young_child_count": young_child_count,
             "young_child_amount": cls._to_json_number(young_child_amount),
@@ -244,13 +255,27 @@ class PctPaymentCalculationRule(AbsStrategy):
         }
 
     @classmethod
+    def paid_child_counts(cls, young_child, primary, secondary, params):
+        wanted = {
+            "secondary": (min(secondary, params["secondary_cap_count"]), params["secondary_unit"]),
+            "young_child": (min(young_child, params["young_child_cap_count"]), params["young_child_unit"]),
+            "primary": (min(primary, params["primary_cap_count"]), params["primary_unit"]),
+        }
+        remaining = params.get("children_cap_count", 3)
+        paid = {}
+        for category in sorted(wanted, key=lambda c: -wanted[c][1]):
+            paid[category] = min(max(wanted[category][0], 0), remaining)
+            remaining -= paid[category]
+        return paid
+
+    @classmethod
     def _resolve_household_count(cls, members, field_name):
-        values = [cls._as_int(cls._get_member_value(individual, field_name)) for individual in members]
+        values = [cls._as_int(cls.member_value(individual, field_name)) for individual in members]
         values = [value for value in values if value is not None and value >= 0]
         return max(values) if values else 0
 
     @classmethod
-    def _member_has_disability(cls, individual):
+    def member_has_disability(cls, individual):
         disability_fields = [
             "wg_visual",
             "wg_hearing",
@@ -266,10 +291,14 @@ class PctPaymentCalculationRule(AbsStrategy):
             "disability_mute",
             "disability_albinism",
         ]
-        return any(cls._is_truthy(cls._get_member_value(individual, field_name)) for field_name in disability_fields)
+        return any(cls._is_truthy(cls.member_value(individual, field_name)) for field_name in disability_fields)
 
     @classmethod
-    def _get_member_value(cls, individual, field_name):
+    def member_is_pregnant(cls, individual, params):
+        return cls._is_truthy(cls.member_value(individual, params["pregnancy_field"]))
+
+    @classmethod
+    def member_value(cls, individual, field_name):
         json_ext = individual.json_ext or {}
         nested_json_ext = json_ext.get("json_ext", {}) if isinstance(json_ext.get("json_ext", {}), dict) else {}
         for source in (json_ext, json_ext.get("raw"), nested_json_ext, nested_json_ext.get("raw")):
@@ -278,12 +307,12 @@ class PctPaymentCalculationRule(AbsStrategy):
         return None
 
     @classmethod
-    def _is_age_in_range(cls, dob, age_min, age_max, reference_date=None):
-        age = cls._age_years(dob, reference_date=reference_date)
+    def is_age_in_range(cls, dob, age_min, age_max, reference_date=None):
+        age = cls.age_years(dob, reference_date=reference_date)
         return age is not None and age_min <= age <= age_max
 
     @classmethod
-    def _age_years(cls, dob, reference_date=None):
+    def age_years(cls, dob, reference_date=None):
         if not dob:
             return None
         if isinstance(dob, date):
@@ -374,3 +403,11 @@ class PctPaymentCalculationRule(AbsStrategy):
             payroll_service = PayrollService(user=user)
             payroll_service.attach_benefit_to_payroll(payroll_id, benefit_id)
         return result_bill_creation
+
+    # Old names, kept while tasaf_payment and this module are deployed separately.
+    _get_rule_params = rule_params
+    _calculate_household_breakdown = household_breakdown
+    _age_years = age_years
+    _is_age_in_range = is_age_in_range
+    _member_has_disability = member_has_disability
+    _get_member_value = member_value
