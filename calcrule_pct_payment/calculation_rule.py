@@ -39,6 +39,15 @@ class PctPaymentCalculationRule(AbsStrategy):
     type = "social_protection"
     sub_type = "benefit_plan"
     CLASS_NAME_CHECK = ["PaymentPlan"]
+    # (code, label, amount key, people key); no people key = the household
+    BREAKDOWN_LINES = (
+        ("DIRECT_SUPPORT", "Direct support", "base_amount", None),
+        ("DISABILITY", "Disability", "disability_amount", None),
+        ("PREGNANCY", "Pregnant women", "pregnant_amount", "pregnant_count"),
+        ("HEALTH", "Health (children 0-5)", "young_child_amount", "young_child_count"),
+        ("PRIMARY", "Primary education", "primary_amount", "primary_count"),
+        ("SECONDARY", "Secondary education", "secondary_amount", "secondary_count"),
+    )
 
     @classmethod
     def run_calculation_rules(cls, sender, instance, user, context, **kwargs):
@@ -252,6 +261,23 @@ class PctPaymentCalculationRule(AbsStrategy):
             "raw_total": cls._to_json_number(raw_total),
             "household_cap_amount": cls._to_json_number(params["household_cap_amount"]),
             "capped_total": cls._to_json_number(capped_total),
+        }
+
+    @classmethod
+    def benefit_breakdown(cls, benefit_json_ext):
+        """The benefit by category; None without a pct_breakdown."""
+        breakdown = (benefit_json_ext or {}).get("pct_breakdown")
+        if not breakdown:
+            return None
+        lines = []
+        for code, label, amount_key, people_key in cls.BREAKDOWN_LINES:
+            amount = cls._as_decimal(breakdown.get(amount_key) or 0)
+            people = int(breakdown.get(people_key) or 0) if people_key else int(amount > 0)
+            lines.append({"code": code, "label": label, "amount": amount, "people": people})
+        return {
+            "lines": lines,
+            "components_total": cls._as_decimal(breakdown.get("raw_total") or 0),
+            "benefit_total": cls._as_decimal(breakdown.get("capped_total") or 0),
         }
 
     @classmethod

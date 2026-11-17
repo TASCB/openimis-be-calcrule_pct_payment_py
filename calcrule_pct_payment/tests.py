@@ -135,3 +135,28 @@ class MemberValueShapesTest(TestCase):
         self.assertEqual(get(nested, "primary"), "3")
         self.assertEqual(get(both, "primary"), "4")
         self.assertIsNone(get(flat, "secondary"))
+
+
+class BenefitBreakdownTest(TestCase):
+    def test_lines_follow_the_breakdown_and_count_people(self):
+        result = PctPaymentCalculationRule.benefit_breakdown({"pct_breakdown": {
+            "base_amount": 14000, "disability_amount": 5000, "pregnant_amount": 0, "pregnant_count": 0,
+            "young_child_amount": 14000, "young_child_count": 2, "primary_amount": 0, "primary_count": 0,
+            "secondary_amount": 8000, "secondary_count": 1, "raw_total": 41000, "capped_total": 41000}})
+        lines = {line["code"]: (line["amount"], line["people"]) for line in result["lines"]}
+        self.assertEqual(lines["DIRECT_SUPPORT"], (Decimal("14000"), 1))
+        self.assertEqual(lines["DISABILITY"], (Decimal("5000"), 1))
+        self.assertEqual(lines["PREGNANCY"], (Decimal("0"), 0))
+        self.assertEqual(lines["HEALTH"], (Decimal("14000"), 2))
+        self.assertEqual(lines["SECONDARY"], (Decimal("8000"), 1))
+        self.assertEqual(sum(line["amount"] for line in result["lines"]), result["components_total"])
+        self.assertEqual(result["benefit_total"], Decimal("41000"))
+
+    def test_an_old_breakdown_without_pregnancy_reads_as_zero(self):
+        result = PctPaymentCalculationRule.benefit_breakdown({"pct_breakdown": {
+            "base_amount": 14000, "raw_total": 14000, "capped_total": 14000}})
+        self.assertEqual(result["components_total"], Decimal("14000"))
+        self.assertEqual([line["amount"] for line in result["lines"]][2], Decimal("0"))
+
+    def test_no_breakdown(self):
+        self.assertIsNone(PctPaymentCalculationRule.benefit_breakdown({}))
